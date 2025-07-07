@@ -1,7 +1,7 @@
 package main
 
 import (
-	mcp_client "gofr_demo/mcp-client"
+	mcp_client "mcp_go_demo/mcp-client"
 )
 
 func main() {
