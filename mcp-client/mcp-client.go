@@ -2,6 +2,7 @@ package mcp_client
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -36,7 +37,8 @@ func MSPSSEClient() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(tools)
+	jsonTools, _ := json.Marshal(tools)
+	fmt.Println(string(jsonTools))
 }
 func MCPStdioClient() {
 	// 创建一个基于 stdio 的MCP客户端
