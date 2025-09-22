@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/util"
 )
 
 // SSE implements the transport layer of the MCP protocol using Server-Sent Events (SSE).
@@ -25,19 +27,34 @@ type SSE struct {
 	baseURL        *url.URL
 	endpoint       *url.URL
 	httpClient     *http.Client
-	responses      map[int64]chan *JSONRPCResponse
+	responses      map[string]chan *JSONRPCResponse
 	mu             sync.RWMutex
 	onNotification func(mcp.JSONRPCNotification)
 	notifyMu       sync.RWMutex
 	endpointChan   chan struct{}
 	headers        map[string]string
+	headerFunc     HTTPHeaderFunc
+	logger         util.Logger
 
-	started         atomic.Bool
-	closed          atomic.Bool
-	cancelSSEStream context.CancelFunc
+	started          atomic.Bool
+	closed           atomic.Bool
+	cancelSSEStream  context.CancelFunc
+	protocolVersion  atomic.Value // string
+	onConnectionLost func(error)
+	connectionLostMu sync.RWMutex
+
+	// OAuth support
+	oauthHandler *OAuthHandler
 }
 
 type ClientOption func(*SSE)
+
+// WithSSELogger sets a custom logger for the SSE client.
+func WithSSELogger(logger util.Logger) ClientOption {
+	return func(sc *SSE) {
+		sc.logger = logger
+	}
+}
 
 func WithHeaders(headers map[string]string) ClientOption {
 	return func(sc *SSE) {
@@ -45,9 +62,21 @@ func WithHeaders(headers map[string]string) ClientOption {
 	}
 }
 
+func WithHeaderFunc(headerFunc HTTPHeaderFunc) ClientOption {
+	return func(sc *SSE) {
+		sc.headerFunc = headerFunc
+	}
+}
+
 func WithHTTPClient(httpClient *http.Client) ClientOption {
 	return func(sc *SSE) {
 		sc.httpClient = httpClient
+	}
+}
+
+func WithOAuth(config OAuthConfig) ClientOption {
+	return func(sc *SSE) {
+		sc.oauthHandler = NewOAuthHandler(config)
 	}
 }
 
@@ -62,13 +91,21 @@ func NewSSE(baseURL string, options ...ClientOption) (*SSE, error) {
 	smc := &SSE{
 		baseURL:      parsedURL,
 		httpClient:   &http.Client{},
-		responses:    make(map[int64]chan *JSONRPCResponse),
+		responses:    make(map[string]chan *JSONRPCResponse),
 		endpointChan: make(chan struct{}),
 		headers:      make(map[string]string),
+		logger:       util.DefaultLogger(),
 	}
 
 	for _, opt := range options {
 		opt(smc)
+	}
+
+	// If OAuth is configured, set the base URL for metadata discovery
+	if smc.oauthHandler != nil {
+		// Extract base URL from server URL for metadata discovery
+		baseURL := fmt.Sprintf("%s://%s", parsedURL.Scheme, parsedURL.Host)
+		smc.oauthHandler.SetBaseURL(baseURL)
 	}
 
 	return smc, nil
@@ -77,7 +114,6 @@ func NewSSE(baseURL string, options ...ClientOption) (*SSE, error) {
 // Start initiates the SSE connection to the server and waits for the endpoint information.
 // Returns an error if the connection fails or times out waiting for the endpoint.
 func (c *SSE) Start(ctx context.Context) error {
-
 	if c.started.Load() {
 		return fmt.Errorf("has already started")
 	}
@@ -86,7 +122,6 @@ func (c *SSE) Start(ctx context.Context) error {
 	c.cancelSSEStream = cancel
 
 	req, err := http.NewRequestWithContext(ctx, "GET", c.baseURL.String(), nil)
-
 	if err != nil {
 		return fmt.Errorf("failed to create request: %w", err)
 	}
@@ -99,6 +134,26 @@ func (c *SSE) Start(ctx context.Context) error {
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
+	if c.headerFunc != nil {
+		for k, v := range c.headerFunc(ctx) {
+			req.Header.Set(k, v)
+		}
+	}
+
+	// Add OAuth authorization if configured
+	if c.oauthHandler != nil {
+		authHeader, err := c.oauthHandler.GetAuthorizationHeader(ctx)
+		if err != nil {
+			// If we get an authorization error, return a specific error that can be handled by the client
+			if err.Error() == "no valid token available, authorization required" {
+				return &OAuthAuthorizationRequiredError{
+					Handler: c.oauthHandler,
+				}
+			}
+			return fmt.Errorf("failed to get authorization header: %w", err)
+		}
+		req.Header.Set("Authorization", authHeader)
+	}
 
 	resp, err := c.httpClient.Do(req)
 	if err != nil {
@@ -107,6 +162,12 @@ func (c *SSE) Start(ctx context.Context) error {
 
 	if resp.StatusCode != http.StatusOK {
 		resp.Body.Close()
+		// Handle OAuth unauthorized error
+		if resp.StatusCode == http.StatusUnauthorized && c.oauthHandler != nil {
+			return &OAuthAuthorizationRequiredError{
+				Handler: c.oauthHandler,
+			}
+		}
 		return fmt.Errorf("unexpected status code: %d", resp.StatusCode)
 	}
 
@@ -144,13 +205,30 @@ func (c *SSE) readSSE(reader io.ReadCloser) {
 		if err != nil {
 			if err == io.EOF {
 				// Process any pending event before exit
-				if event != "" && data != "" {
+				if data != "" {
+					// If no event type is specified, use empty string (default event type)
+					if event == "" {
+						event = "message"
+					}
 					c.handleSSEEvent(event, data)
 				}
 				break
 			}
+			// Checking whether the connection was terminated due to NO_ERROR in HTTP2 based on RFC9113
+			// Only handle NO_ERROR specially if onConnectionLost handler is set to maintain backward compatibility
+			if strings.Contains(err.Error(), "NO_ERROR") {
+				c.connectionLostMu.RLock()
+				handler := c.onConnectionLost
+				c.connectionLostMu.RUnlock()
+
+				if handler != nil {
+					// This is not actually an error - HTTP2 idle timeout disconnection
+					handler(err)
+					return
+				}
+			}
 			if !c.closed.Load() {
-				fmt.Printf("SSE stream error: %v\n", err)
+				c.logger.Errorf("SSE stream error: %v", err)
 			}
 			return
 		}
@@ -159,7 +237,11 @@ func (c *SSE) readSSE(reader io.ReadCloser) {
 		line = strings.TrimRight(line, "\r\n")
 		if line == "" {
 			// Empty line means end of event
-			if event != "" && data != "" {
+			if data != "" {
+				// If no event type is specified, use empty string (default event type)
+				if event == "" {
+					event = "message"
+				}
 				c.handleSSEEvent(event, data)
 				event = ""
 				data = ""
@@ -182,11 +264,11 @@ func (c *SSE) handleSSEEvent(event, data string) {
 	case "endpoint":
 		endpoint, err := c.baseURL.Parse(data)
 		if err != nil {
-			fmt.Printf("Error parsing endpoint URL: %v\n", err)
+			c.logger.Errorf("Error parsing endpoint URL: %v", err)
 			return
 		}
 		if endpoint.Host != c.baseURL.Host {
-			fmt.Printf("Endpoint origin does not match connection origin\n")
+			c.logger.Errorf("Endpoint origin does not match connection origin")
 			return
 		}
 		c.endpoint = endpoint
@@ -195,12 +277,12 @@ func (c *SSE) handleSSEEvent(event, data string) {
 	case "message":
 		var baseMessage JSONRPCResponse
 		if err := json.Unmarshal([]byte(data), &baseMessage); err != nil {
-			fmt.Printf("Error unmarshaling message: %v\n", err)
+			c.logger.Errorf("Error unmarshaling message: %v", err)
 			return
 		}
 
 		// Handle notification
-		if baseMessage.ID == nil {
+		if baseMessage.ID.IsNil() {
 			var notification mcp.JSONRPCNotification
 			if err := json.Unmarshal([]byte(data), &notification); err != nil {
 				return
@@ -213,14 +295,17 @@ func (c *SSE) handleSSEEvent(event, data string) {
 			return
 		}
 
+		// Create string key for map lookup
+		idKey := baseMessage.ID.String()
+
 		c.mu.RLock()
-		ch, ok := c.responses[*baseMessage.ID]
+		ch, exists := c.responses[idKey]
 		c.mu.RUnlock()
 
-		if ok {
+		if exists {
 			ch <- &baseMessage
 			c.mu.Lock()
-			delete(c.responses, *baseMessage.ID)
+			delete(c.responses, idKey)
 			c.mu.Unlock()
 		}
 	}
@@ -232,13 +317,18 @@ func (c *SSE) SetNotificationHandler(handler func(notification mcp.JSONRPCNotifi
 	c.onNotification = handler
 }
 
+func (c *SSE) SetConnectionLostHandler(handler func(error)) {
+	c.connectionLostMu.Lock()
+	defer c.connectionLostMu.Unlock()
+	c.onConnectionLost = handler
+}
+
 // SendRequest sends a JSON-RPC request to the server and waits for a response.
 // Returns the raw JSON response message or an error if the request fails.
 func (c *SSE) SendRequest(
 	ctx context.Context,
 	request JSONRPCRequest,
 ) (*JSONRPCResponse, error) {
-
 	if !c.started.Load() {
 		return nil, fmt.Errorf("transport not started yet")
 	}
@@ -263,18 +353,48 @@ func (c *SSE) SendRequest(
 
 	// Set headers
 	req.Header.Set("Content-Type", "application/json")
+	// Set protocol version header if negotiated
+	if v := c.protocolVersion.Load(); v != nil {
+		if version, ok := v.(string); ok && version != "" {
+			req.Header.Set(HeaderKeyProtocolVersion, version)
+		}
+	}
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
 	}
 
+	// Add OAuth authorization if configured
+	if c.oauthHandler != nil {
+		authHeader, err := c.oauthHandler.GetAuthorizationHeader(ctx)
+		if err != nil {
+			// If we get an authorization error, return a specific error that can be handled by the client
+			if err.Error() == "no valid token available, authorization required" {
+				return nil, &OAuthAuthorizationRequiredError{
+					Handler: c.oauthHandler,
+				}
+			}
+			return nil, fmt.Errorf("failed to get authorization header: %w", err)
+		}
+		req.Header.Set("Authorization", authHeader)
+	}
+
+	if c.headerFunc != nil {
+		for k, v := range c.headerFunc(ctx) {
+			req.Header.Set(k, v)
+		}
+	}
+
+	// Create string key for map lookup
+	idKey := request.ID.String()
+
 	// Register response channel
 	responseChan := make(chan *JSONRPCResponse, 1)
 	c.mu.Lock()
-	c.responses[request.ID] = responseChan
+	c.responses[idKey] = responseChan
 	c.mu.Unlock()
 	deleteResponseChan := func() {
 		c.mu.Lock()
-		delete(c.responses, request.ID)
+		delete(c.responses, idKey)
 		c.mu.Unlock()
 	}
 
@@ -297,6 +417,13 @@ func (c *SSE) SendRequest(
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
 		deleteResponseChan()
 
+		// Handle OAuth unauthorized error
+		if resp.StatusCode == http.StatusUnauthorized && c.oauthHandler != nil {
+			return nil, &OAuthAuthorizationRequiredError{
+				Handler: c.oauthHandler,
+			}
+		}
+
 		return nil, fmt.Errorf("request failed with status %d: %s", resp.StatusCode, body)
 	}
 
@@ -304,8 +431,11 @@ func (c *SSE) SendRequest(
 	case <-ctx.Done():
 		deleteResponseChan()
 		return nil, ctx.Err()
-	case response := <-responseChan:
-		return response, nil
+	case response, ok := <-responseChan:
+		if ok {
+			return response, nil
+		}
+		return nil, fmt.Errorf("connection has been closed")
 	}
 }
 
@@ -327,10 +457,21 @@ func (c *SSE) Close() error {
 	for _, ch := range c.responses {
 		close(ch)
 	}
-	c.responses = make(map[int64]chan *JSONRPCResponse)
+	c.responses = make(map[string]chan *JSONRPCResponse)
 	c.mu.Unlock()
 
 	return nil
+}
+
+// GetSessionId returns the session ID of the transport.
+// Since SSE does not maintain a session ID, it returns an empty string.
+func (c *SSE) GetSessionId() string {
+	return ""
+}
+
+// SetProtocolVersion sets the negotiated protocol version for this connection.
+func (c *SSE) SetProtocolVersion(version string) {
+	c.protocolVersion.Store(version)
 }
 
 // SendNotification sends a JSON-RPC notification to the server without expecting a response.
@@ -355,9 +496,36 @@ func (c *SSE) SendNotification(ctx context.Context, notification mcp.JSONRPCNoti
 	}
 
 	req.Header.Set("Content-Type", "application/json")
+	// Set protocol version header if negotiated
+	if v := c.protocolVersion.Load(); v != nil {
+		if version, ok := v.(string); ok && version != "" {
+			req.Header.Set(HeaderKeyProtocolVersion, version)
+		}
+	}
 	// Set custom HTTP headers
 	for k, v := range c.headers {
 		req.Header.Set(k, v)
+	}
+
+	// Add OAuth authorization if configured
+	if c.oauthHandler != nil {
+		authHeader, err := c.oauthHandler.GetAuthorizationHeader(ctx)
+		if err != nil {
+			// If we get an authorization error, return a specific error that can be handled by the client
+			if errors.Is(err, ErrOAuthAuthorizationRequired) {
+				return &OAuthAuthorizationRequiredError{
+					Handler: c.oauthHandler,
+				}
+			}
+			return fmt.Errorf("failed to get authorization header: %w", err)
+		}
+		req.Header.Set("Authorization", authHeader)
+	}
+
+	if c.headerFunc != nil {
+		for k, v := range c.headerFunc(ctx) {
+			req.Header.Set(k, v)
+		}
 	}
 
 	resp, err := c.httpClient.Do(req)
@@ -367,6 +535,13 @@ func (c *SSE) SendNotification(ctx context.Context, notification mcp.JSONRPCNoti
 	defer resp.Body.Close()
 
 	if resp.StatusCode != http.StatusOK && resp.StatusCode != http.StatusAccepted {
+		// Handle OAuth unauthorized error
+		if resp.StatusCode == http.StatusUnauthorized && c.oauthHandler != nil {
+			return &OAuthAuthorizationRequiredError{
+				Handler: c.oauthHandler,
+			}
+		}
+
 		body, _ := io.ReadAll(resp.Body)
 		return fmt.Errorf(
 			"notification failed with status %d: %s",
@@ -386,4 +561,14 @@ func (c *SSE) GetEndpoint() *url.URL {
 // GetBaseURL returns the base URL set in the SSE constructor.
 func (c *SSE) GetBaseURL() *url.URL {
 	return c.baseURL
+}
+
+// GetOAuthHandler returns the OAuth handler if configured
+func (c *SSE) GetOAuthHandler() *OAuthHandler {
+	return c.oauthHandler
+}
+
+// IsOAuthEnabled returns true if OAuth is enabled
+func (c *SSE) IsOAuthEnabled() bool {
+	return c.oauthHandler != nil
 }

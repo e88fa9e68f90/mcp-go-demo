@@ -11,10 +11,28 @@ import (
 )
 
 type InProcessTransport struct {
-	server *server.MCPServer
+	server             *server.MCPServer
+	samplingHandler    server.SamplingHandler
+	elicitationHandler server.ElicitationHandler
+	session            *server.InProcessSession
+	sessionID          string
 
 	onNotification func(mcp.JSONRPCNotification)
 	notifyMu       sync.RWMutex
+}
+
+type InProcessOption func(*InProcessTransport)
+
+func WithSamplingHandler(handler server.SamplingHandler) InProcessOption {
+	return func(t *InProcessTransport) {
+		t.samplingHandler = handler
+	}
+}
+
+func WithElicitationHandler(handler server.ElicitationHandler) InProcessOption {
+	return func(t *InProcessTransport) {
+		t.elicitationHandler = handler
+	}
 }
 
 func NewInProcessTransport(server *server.MCPServer) *InProcessTransport {
@@ -23,7 +41,27 @@ func NewInProcessTransport(server *server.MCPServer) *InProcessTransport {
 	}
 }
 
+func NewInProcessTransportWithOptions(server *server.MCPServer, opts ...InProcessOption) *InProcessTransport {
+	t := &InProcessTransport{
+		server:    server,
+		sessionID: server.GenerateInProcessSessionID(),
+	}
+
+	for _, opt := range opts {
+		opt(t)
+	}
+
+	return t
+}
+
 func (c *InProcessTransport) Start(ctx context.Context) error {
+	// Create and register session if we have handlers
+	if c.samplingHandler != nil || c.elicitationHandler != nil {
+		c.session = server.NewInProcessSessionWithHandlers(c.sessionID, c.samplingHandler, c.elicitationHandler)
+		if err := c.server.RegisterSession(ctx, c.session); err != nil {
+			return fmt.Errorf("failed to register session: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -33,6 +71,11 @@ func (c *InProcessTransport) SendRequest(ctx context.Context, request JSONRPCReq
 		return nil, fmt.Errorf("failed to marshal request: %w", err)
 	}
 	requestBytes = append(requestBytes, '\n')
+
+	// Add session to context if available
+	if c.session != nil {
+		ctx = c.server.WithContext(ctx, c.session)
+	}
 
 	respMessage := c.server.HandleMessage(ctx, requestBytes)
 	respByte, err := json.Marshal(respMessage)
@@ -65,6 +108,13 @@ func (c *InProcessTransport) SetNotificationHandler(handler func(notification mc
 	c.onNotification = handler
 }
 
-func (*InProcessTransport) Close() error {
+func (c *InProcessTransport) Close() error {
+	if c.session != nil {
+		c.server.UnregisterSession(context.Background(), c.sessionID)
+	}
 	return nil
+}
+
+func (c *InProcessTransport) GetSessionId() string {
+	return ""
 }
