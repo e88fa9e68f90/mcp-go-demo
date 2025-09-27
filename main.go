@@ -1,7 +1,8 @@
 package main
 
-import mcpserver "mcp_go_demo/mcp-server"
+import mcp_server "mcp_go_demo/mcp-server"
 
 func main() {
-	mcpserver.MCPServer()
+	//mcpserver.MCPSSEServer()
+	mcp_server.MCPStreamableServer()
 }

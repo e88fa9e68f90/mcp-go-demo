@@ -10,7 +10,9 @@ import (
 )
 
 func MSPSSEClient() {
-	cli, err := client.NewSSEMCPClient("http://127.0.0.1:8000/sse")
+	//prompt := "http://127.0.0.1:8000/mcp"
+	streamable := "https://pensionlife.95522.cn/tkp-wechat-mcp-server-go/serv/mcp"
+	cli, err := client.NewStreamableHttpClient(streamable)
 	if err != nil {
 		panic(err)
 	}
@@ -31,14 +33,21 @@ func MSPSSEClient() {
 	if err != nil {
 		panic(err)
 	}
-	fmt.Println(result)
+	resultJson, _ := json.Marshal(result)
+	fmt.Println(string(resultJson))
 
+	prompts, err := cli.ListPrompts(context.Background(), mcp.ListPromptsRequest{})
+	if err != nil {
+		panic(err)
+	}
+	promptsJson, _ := json.Marshal(prompts)
+	fmt.Println("promptsJson = ", string(promptsJson))
 	tools, err := cli.ListTools(context.Background(), mcp.ListToolsRequest{})
 	if err != nil {
 		panic(err)
 	}
 	jsonTools, _ := json.Marshal(tools)
-	fmt.Println(string(jsonTools))
+	fmt.Println("jsonTools = ", string(jsonTools))
 }
 func MCPStdioClient() {
 	// 创建一个基于 stdio 的MCP客户端
