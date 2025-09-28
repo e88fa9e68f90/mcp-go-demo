@@ -1,9 +1,9 @@
 package main
 
-import (
-	mcpclient "mcp_go_demo/mcp-client"
-)
+import mcp_server "mcp_go_demo/mcp-server"
 
 func main() {
-	mcpclient.MSPSSEClient()
+	//mcp_server.CreateBarChart()
+	mcp_server.ListenServer()
+	//mcp_server.CreatePieChartToPNG()
 }
